@@ -67,6 +67,20 @@ def get_signal() -> Tuple[bytes, List[int], object]:
     return seed, outs, s
 
 
+def gen_random_signal() -> Tuple[bytes, List[int]]:
+    key = os.urandom(FRAME_LEN)
+    seed = os.urandom(8)
+    rng = random.Random(seed)
+    outs: List[int] = []
+    for _ in range(NUM_FRAMES):
+        row = [rng.getrandbits(32) for _ in range(FRAME_LEN)]
+        acc = 0
+        for x, y in zip(row, key):
+            acc = (acc + (x * y)) & MASK
+        outs.append(adc_read(acc))
+    return seed, outs
+
+
 def gen_matrix(seed: bytes) -> Tuple[List[List[int]], List[List[int]]]:
     rng = random.Random(seed)
     A_unsigned: List[List[int]] = []
@@ -243,6 +257,17 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
 
 
 def main() -> None:
+    if os.environ.get("SELFTEST") == "1":
+        n = int(os.environ.get("SELFTEST_N", "1"))
+        for i in range(n):
+            seed, outs = gen_random_signal()
+            print(f"[*] SELFTEST {i+1}/{n} seed={seed.hex()}", flush=True)
+            key = solve(seed, outs)
+            if len(key) != FRAME_LEN:
+                raise RuntimeError("SELFTEST produced wrong key length")
+            print("[+] SELFTEST OK", flush=True)
+        return
+
     seed, outs, sock = get_signal()
     key = solve(seed, outs)
     sock.sendall(key.hex().encode() + b"\n")
@@ -257,4 +282,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
