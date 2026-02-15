@@ -346,11 +346,11 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
 
         # Enforce SVP timeout by killing long-running workers.
         for i in range(len(procs)):
-            p, start_ts, idx, frames, W = procs[i]
+            p, start_ts, idx, frames, W, r = procs[i]
             if not p.is_alive():
                 continue
             if now - start_ts > svp_timeout_s:
-                print(f"[-] timeout: idx={idx} frames={frames} W={W} killing worker", flush=True)
+                print(f"[-] timeout: idx={idx} frames={frames} W={W} r={r} killing worker", flush=True)
                 try:
                     p.terminate()
                 except Exception:
