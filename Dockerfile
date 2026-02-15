@@ -1,4 +1,4 @@
-FROM --platform=$TARGETPLATFORM python:3.11-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
@@ -10,9 +10,13 @@ WORKDIR /work
 
 # Install fpylll from PyPI (manylinux wheel on amd64). If a build is needed,
 # deps above are enough for typical installs.
+ARG FPYLLL_VERSION=0.6.4
+ARG CYSIGNALS_VERSION=1.12.4
+
 RUN pip install --no-cache-dir -U pip setuptools wheel \
-  && pip install --no-cache-dir cysignals==1.12.4 \
-  && pip install --no-cache-dir fpylll==0.6.4
+  && pip install --no-cache-dir Cython==3.0.12 \
+  && pip install --no-cache-dir "cysignals==${CYSIGNALS_VERSION}" \
+  && pip install --no-cache-dir "fpylll==${FPYLLL_VERSION}"
 
 COPY . /work
 

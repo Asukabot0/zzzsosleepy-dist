@@ -6,11 +6,11 @@ import struct
 import time
 from typing import List, Tuple, Optional
 
-from fpylll import IntegerMatrix, LLL, BKZ
+from fpylll import IntegerMatrix, LLL, SVP, BKZ
 from fpylll.fplll import bkz_param
 
 HOST = os.environ.get("HOST", "challenges.1pc.tf")
-PORT = int(os.environ.get("PORT", "25857"))
+PORT = int(os.environ.get("PORT", "28518"))
 
 FRAME_LEN = 80
 NUM_FRAMES = 120
@@ -21,8 +21,10 @@ MASK = Q - 1
 
 
 def _patch_fplll_strategies() -> None:
-    # Some fpylll wheels hardcode a CI path for default.json. Make SVP/BKZ load
-    # strategies from the local checkout if present.
+    """
+    Some fpylll builds hardcode a non-existent strategies path at build time.
+    Force SVP/BKZ to use the repo-bundled default.json if present.
+    """
     strat_dir = os.path.join(os.path.dirname(__file__), "fplll_strategies")
     strat_file = os.path.join(strat_dir, "default.json")
     if not os.path.exists(strat_file):
@@ -30,6 +32,8 @@ def _patch_fplll_strategies() -> None:
 
     strat_dir_b = strat_dir.encode()
     strat_file_b = strat_file.encode()
+
+    # These attributes exist in current fpylll builds.
     BKZ.DEFAULT_STRATEGY_PATH = strat_dir_b
     BKZ.DEFAULT_STRATEGY = strat_file_b
     bkz_param.default_strategy_path = strat_dir_b
@@ -105,15 +109,18 @@ def build_basis(A_signed: List[List[int]], B: List[int], *, W: int, WT: int) -> 
     dim = n + m + 1
     M = IntegerMatrix(dim, dim)
 
+    # Top-left: W*I
     for i in range(n):
         M[i, i] = W
         for j in range(m):
             M[i, n + j] = A_signed[j][i]
 
+    # Middle: -q*I
     for j in range(m):
         r = n + j
         M[r, r] = -Q
 
+    # Last row: -B, WT
     last = dim - 1
     for j in range(m):
         M[last, n + j] = -B[j]
@@ -130,28 +137,23 @@ def try_extract_key(
     W: int,
     WT: int,
 ) -> Optional[bytes]:
-    n = FRAME_LEN
-    m = len(outs)
-
     if abs(vec[-1]) != WT:
         return None
     if vec[-1] == -WT:
         vec = [-x for x in vec]
 
-    kprime = []
-    for i in range(n):
+    key = []
+    for i in range(FRAME_LEN):
         if vec[i] % W != 0:
             return None
-        kprime.append(vec[i] // W)
-
-    key = []
-    for kp in kprime:
+        kp = vec[i] // W
         k = kp + 128
         if not (0 <= k <= 255):
             return None
         key.append(k)
 
-    for j in range(m):
+    # Verify on the equations used in the lattice (cheap) and then on all 120 frames (full).
+    for j in range(len(outs)):
         acc = 0
         row = A_unsigned[j]
         for x, y in zip(row, key):
@@ -162,68 +164,71 @@ def try_extract_key(
     return bytes(key)
 
 
-def _scan_basis(M: IntegerMatrix, A_unsigned_s, outs_s, *, W: int, WT: int, limit: int = 60) -> Optional[bytes]:
-    dim = M.nrows
-    for i in range(min(dim, limit)):
-        vec = [int(M[i, j]) for j in range(dim)]
-        key = try_extract_key(vec, A_unsigned_s, outs_s, W=W, WT=WT)
-        if key is not None:
-            return key
-    return None
+def verify_all(seed: bytes, outs_full: List[int], key: bytes) -> bool:
+    A_unsigned, _ = gen_matrix(seed)
+    for j in range(NUM_FRAMES):
+        acc = 0
+        for x, y in zip(A_unsigned[j], key):
+            acc = (acc + (x * y)) & MASK
+        if adc_read(acc) != outs_full[j]:
+            return False
+    return True
 
 
-def solve(seed: bytes, outs: List[int]) -> bytes:
+def solve(seed: bytes, outs_full: List[int]) -> bytes:
+    # Centering/scaling parameters (from the intended solution writeup).
     W = 1 << 14
     WT = 1 << 21
 
     t0 = time.time()
-    A_unsigned, A_signed = gen_matrix(seed)
+    A_unsigned_full, A_signed_full = gen_matrix(seed)
     print(f"[*] Matrix generated in {time.time() - t0:.2f}s", flush=True)
 
-    # Keep dimensions modest to avoid huge BKZ memory/time on Docker Desktop.
-    for frames in (70, 78, 86, 94, 102):
-        print(f"[*] === frames={frames} ===", flush=True)
-        idx = list(range(frames))
-        outs_s = [outs[i] for i in idx]
-        A_unsigned_s = [A_unsigned[i] for i in idx]
-        A_signed_s = [A_signed[i] for i in idx]
+    # Try increasing number of equations. More equations increases dimension but can help uniqueness.
+    for frames in (80, 90, 100, 110, 120):
+        outs = outs_full[:frames]
+        A_unsigned = A_unsigned_full[:frames]
+        A_signed = A_signed_full[:frames]
 
+        print(f"[*] === frames={frames} dim={FRAME_LEN + frames + 1} ===", flush=True)
         t1 = time.time()
-        B = build_B(A_signed_s, outs_s)
-        M = build_basis(A_signed_s, B, W=W, WT=WT)
-        print(f"[*] Built basis dim={M.nrows} in {time.time() - t1:.2f}s", flush=True)
+        B = build_B(A_signed, outs)
+        M = build_basis(A_signed, B, W=W, WT=WT)
+        print(f"[*] Built basis in {time.time() - t1:.2f}s", flush=True)
 
-        t_lll = time.time()
+        # LLL pre-reduction.
         print("[*] LLL start", flush=True)
+        t_lll = time.time()
         LLL.reduction(M, delta=0.99)
-        print(f"[*] LLL done in {time.time() - t_lll:.2f}s, scanning basis ...", flush=True)
-        key = _scan_basis(M, A_unsigned_s, outs_s, W=W, WT=WT, limit=M.nrows)
-        if key is not None:
-            return key
-        print("[*] Scan miss after LLL", flush=True)
+        print(f"[*] LLL done in {time.time() - t_lll:.2f}s", flush=True)
 
-        # BKZ is usually enough; much cheaper than full SVP enumeration here.
-        for bs in (12, 15, 18, 22, 26, 30):
-            max_time = 30 if bs <= 18 else (90 if bs <= 26 else 120)
-            max_loops = 2 if bs <= 18 else (5 if bs <= 26 else 6)
-            print(f"[*] BKZ-{bs} start (max_time={max_time}s max_loops={max_loops})", flush=True)
-            # Cap runtime: prevent runaway BKZ from getting SIGKILLed by the host.
-            # Increase caps gradually with blocksize.
-            t_bkz = time.time()
-            BKZ.reduction(
-                M,
-                BKZ.Param(
-                    block_size=bs,
-                    max_loops=max_loops,
-                    max_time=max_time,
-                    rerandomization_density=3,
-                ),
-            )
-            print(f"[*] BKZ-{bs} done in {time.time() - t_bkz:.2f}s, scanning basis ...", flush=True)
-            key = _scan_basis(M, A_unsigned_s, outs_s, W=W, WT=WT, limit=M.nrows)
-            if key is not None:
+        # Check reduced basis vectors first (often hits immediately).
+        dim = M.nrows
+        print(f"[*] Scanning {dim} basis vectors ...", flush=True)
+        for i in range(dim):
+            vec = [int(M[i, j]) for j in range(dim)]
+            key = try_extract_key(vec, A_unsigned, outs, W=W, WT=WT)
+            if key is None:
+                continue
+            if verify_all(seed, outs_full, key):
+                print("[+] Key verified on all frames", flush=True)
                 return key
-            print(f"[*] Scan miss after BKZ-{bs}", flush=True)
+
+        # Avoid BKZ: many builds hit "infinite loop in babai". Use SVP enumeration instead.
+        # Note: SVP may still rely on strategies; _patch_fplll_strategies() handles that.
+        print("[*] Basis scan miss, trying SVP.shortest_vector(preprocess=False) ...", flush=True)
+        try:
+            v = SVP.shortest_vector(M, method="fast", pruning=False, preprocess=False)
+        except Exception as e:
+            print(f"[-] SVP failed: {e}", flush=True)
+            continue
+
+        key = try_extract_key([int(x) for x in v], A_unsigned, outs, W=W, WT=WT)
+        if key is not None and verify_all(seed, outs_full, key):
+            print("[+] Key verified on all frames", flush=True)
+            return key
+
+        print("[*] SVP miss", flush=True)
 
     raise RuntimeError("key not found")
 
@@ -239,8 +244,9 @@ def main() -> None:
         resp += sock.recv(8192)
     except Exception:
         pass
-    print(resp.decode(errors="replace"))
+    print(resp.decode(errors="replace"), flush=True)
 
 
 if __name__ == "__main__":
     main()
+
