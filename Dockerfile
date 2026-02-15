@@ -19,4 +19,4 @@ COPY . /work
 # Make sure strategies exist for wheels that hardcode a missing default path.
 RUN test -f /work/fplll_strategies/default.json || true
 
-CMD ["python3", "solve_svp.py"]
+CMD ["python3", "-u", "solve_svp.py"]

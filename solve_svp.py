@@ -3,6 +3,7 @@ import base64
 import os
 import random
 import struct
+import time
 from typing import List, Tuple, Optional
 
 from fpylll import IntegerMatrix, LLL, BKZ
@@ -42,6 +43,7 @@ def adc_read(acc_u32: int) -> int:
 def get_signal() -> Tuple[bytes, List[int], object]:
     import socket
 
+    print(f"[*] Connecting to {HOST}:{PORT} ...", flush=True)
     s = socket.create_connection((HOST, PORT), timeout=10)
     f = s.makefile("rb", buffering=0)
 
@@ -65,6 +67,7 @@ def get_signal() -> Tuple[bytes, List[int], object]:
 
     seed = raw[:8]
     outs = list(struct.unpack("<" + "H" * NUM_FRAMES, raw[8:]))
+    print(f"[*] Got signal: seed={seed.hex()} frames={len(outs)}", flush=True)
     return seed, outs, s
 
 
@@ -173,32 +176,40 @@ def solve(seed: bytes, outs: List[int]) -> bytes:
     W = 1 << 14
     WT = 1 << 21
 
+    t0 = time.time()
     A_unsigned, A_signed = gen_matrix(seed)
+    print(f"[*] Matrix generated in {time.time() - t0:.2f}s", flush=True)
 
     # Keep dimensions modest to avoid huge BKZ memory/time on Docker Desktop.
     for frames in (70, 78, 86, 94, 102):
+        print(f"[*] === frames={frames} ===", flush=True)
         idx = list(range(frames))
         outs_s = [outs[i] for i in idx]
         A_unsigned_s = [A_unsigned[i] for i in idx]
         A_signed_s = [A_signed[i] for i in idx]
 
+        t1 = time.time()
         B = build_B(A_signed_s, outs_s)
         M = build_basis(A_signed_s, B, W=W, WT=WT)
-        print(f"[*] frames={frames} dim={M.nrows}", flush=True)
+        print(f"[*] Built basis dim={M.nrows} in {time.time() - t1:.2f}s", flush=True)
 
-        print("[*] LLL...", flush=True)
+        t_lll = time.time()
+        print("[*] LLL start", flush=True)
         LLL.reduction(M, delta=0.99)
+        print(f"[*] LLL done in {time.time() - t_lll:.2f}s, scanning basis ...", flush=True)
         key = _scan_basis(M, A_unsigned_s, outs_s, W=W, WT=WT, limit=M.nrows)
         if key is not None:
             return key
+        print("[*] Scan miss after LLL", flush=True)
 
         # BKZ is usually enough; much cheaper than full SVP enumeration here.
         for bs in (12, 15, 18, 22, 26, 30):
-            print(f"[*] BKZ-{bs} (capped)...", flush=True)
-            # Cap runtime: prevent runaway BKZ from getting SIGKILLed by the host.
-            # Increase caps gradually with blocksize.
             max_time = 30 if bs <= 18 else (90 if bs <= 26 else 120)
             max_loops = 2 if bs <= 18 else (5 if bs <= 26 else 6)
+            print(f"[*] BKZ-{bs} start (max_time={max_time}s max_loops={max_loops})", flush=True)
+            # Cap runtime: prevent runaway BKZ from getting SIGKILLed by the host.
+            # Increase caps gradually with blocksize.
+            t_bkz = time.time()
             BKZ.reduction(
                 M,
                 BKZ.Param(
@@ -208,9 +219,11 @@ def solve(seed: bytes, outs: List[int]) -> bytes:
                     rerandomization_density=3,
                 ),
             )
+            print(f"[*] BKZ-{bs} done in {time.time() - t_bkz:.2f}s, scanning basis ...", flush=True)
             key = _scan_basis(M, A_unsigned_s, outs_s, W=W, WT=WT, limit=M.nrows)
             if key is not None:
                 return key
+            print(f"[*] Scan miss after BKZ-{bs}", flush=True)
 
     raise RuntimeError("key not found")
 
