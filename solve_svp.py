@@ -7,7 +7,7 @@ import signal
 import struct
 import time
 import multiprocessing as mp
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from fpylll import IntegerMatrix, LLL, SVP, BKZ
 from fpylll.fplll import bkz_param
@@ -178,6 +178,94 @@ def verify_all(seed: bytes, outs_full: List[int], key: bytes) -> bool:
     return True
 
 
+def _worker_entry(
+    result_q,
+    stop_evt,
+    seed: bytes,
+    outs_full: List[int],
+    A_unsigned_full: List[List[int]],
+    A_signed_full: List[List[int]],
+    WT: int,
+    idx: int,
+    frames: int,
+    W: int,
+    r: int,
+) -> None:
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+    outs = outs_full[:frames]
+    A_unsigned = A_unsigned_full[:frames]
+    A_signed = A_signed_full[:frames]
+
+    dim = FRAME_LEN + frames + 1
+    prefix = f"[w{idx:04d} frames={frames} W={W} r={r} dim={dim}]"
+    print(f"{prefix} start", flush=True)
+    result_q.put(("stat", idx, frames, W, r, "start"))
+
+    try:
+        B = build_B(A_signed, outs)
+        M = build_basis(A_signed, B, W=W, WT=WT)
+    except Exception as e:
+        result_q.put(("err", idx, frames, W, r, f"build: {e}"))
+        return
+
+    rng = random.Random(seed + frames.to_bytes(2, "little") + W.to_bytes(4, "little") + r.to_bytes(4, "little"))
+    if r != 0:
+        for i in range(M.nrows - 1, 0, -1):
+            j = rng.randrange(i + 1)
+            if i != j:
+                M.swap_rows(i, j)
+        for _ in range(M.nrows // 3):
+            i = rng.randrange(M.nrows)
+            j = rng.randrange(M.nrows)
+            if i == j:
+                continue
+            c = rng.choice([-2, -1, 1, 2])
+            for col in range(M.ncols):
+                M[i, col] = int(M[i, col]) + c * int(M[j, col])
+
+    try:
+        result_q.put(("stat", idx, frames, W, r, "lll"))
+        t_lll = time.time()
+        LLL.reduction(M, delta=0.99)
+        print(f"{prefix} LLL {time.time() - t_lll:.2f}s", flush=True)
+    except Exception as e:
+        result_q.put(("err", idx, frames, W, r, f"LLL: {e}"))
+        return
+
+    result_q.put(("stat", idx, frames, W, r, "scan"))
+    for i in range(M.nrows):
+        vec = [int(M[i, j]) for j in range(M.nrows)]
+        key = try_extract_key(vec, A_unsigned, outs, W=W, WT=WT)
+        if key is None:
+            continue
+        if verify_all(seed, outs_full, key):
+            result_q.put(("ok", idx, frames, W, r, key.hex()))
+            return
+
+    if stop_evt.is_set():
+        result_q.put(("skip", idx, frames, W, r, "stopped"))
+        return
+
+    print(f"{prefix} SVP start (no internal progress)", flush=True)
+    result_q.put(("stat", idx, frames, W, r, "svp"))
+    try:
+        v = SVP.shortest_vector(M, method="fast", pruning=False, preprocess=False)
+    except Exception as e:
+        result_q.put(("err", idx, frames, W, r, f"SVP: {e}"))
+        return
+
+    key = try_extract_key([int(x) for x in v], A_unsigned, outs, W=W, WT=WT)
+    if key is not None and verify_all(seed, outs_full, key):
+        result_q.put(("ok", idx, frames, W, r, key.hex()))
+        return
+
+    result_q.put(("miss", idx, frames, W, r, "no key"))
+
+
 def solve(seed: bytes, outs_full: List[int]) -> bytes:
     """
     Multi-core strategy:
@@ -233,93 +321,20 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
     total = len(attempts)
 
     # IPC
+    # result_q carries both results and status messages.
     result_q: mp.Queue = mp.Queue()
     stop_evt = mp.Event()
 
-    def worker(idx: int, frames: int, W: int, r: int) -> None:
-        try:
-            # Allow parent to kill us cleanly.
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-        except Exception:
-            pass
-
-        outs = outs_full[:frames]
-        A_unsigned = A_unsigned_full[:frames]
-        A_signed = A_signed_full[:frames]
-
-        dim = FRAME_LEN + frames + 1
-        prefix = f"[w{idx:04d} frames={frames} W={W} r={r} dim={dim}]"
-        print(f"{prefix} start", flush=True)
-
-        try:
-            B = build_B(A_signed, outs)
-            M = build_basis(A_signed, B, W=W, WT=WT)
-        except Exception as e:
-            result_q.put(("err", idx, frames, W, f"build: {e}"))
-            return
-
-        # Randomized unimodular perturbation to escape unlucky reductions.
-        # This keeps the lattice the same while changing the basis.
-        rng = random.Random(seed + frames.to_bytes(2, "little") + W.to_bytes(4, "little") + r.to_bytes(4, "little"))
-        if r != 0:
-            # Row swaps
-            for i in range(M.nrows - 1, 0, -1):
-                j = rng.randrange(i + 1)
-                if i != j:
-                    M.swap_rows(i, j)
-            # Light row mixing
-            for _ in range(M.nrows // 3):
-                i = rng.randrange(M.nrows)
-                j = rng.randrange(M.nrows)
-                if i == j:
-                    continue
-                c = rng.choice([-2, -1, 1, 2])
-                for col in range(M.ncols):
-                    M[i, col] = int(M[i, col]) + c * int(M[j, col])
-
-        try:
-            t_lll = time.time()
-            LLL.reduction(M, delta=0.99)
-            print(f"{prefix} LLL {time.time() - t_lll:.2f}s", flush=True)
-        except Exception as e:
-            result_q.put(("err", idx, frames, W, f"LLL: {e}"))
-            return
-
-        # Scan basis (cheap).
-        for i in range(M.nrows):
-            vec = [int(M[i, j]) for j in range(M.nrows)]
-            key = try_extract_key(vec, A_unsigned, outs, W=W, WT=WT)
-            if key is None:
-                continue
-            if verify_all(seed, outs_full, key):
-                result_q.put(("ok", idx, frames, W, key.hex()))
-                return
-
-        if stop_evt.is_set():
-            result_q.put(("skip", idx, frames, W, "stopped"))
-            return
-
-        # SVP call: no incremental progress output inside fpylll, so we time-cap the attempt
-        # by letting the parent terminate the process if it runs too long.
-        print(f"{prefix} SVP start (no internal progress)", flush=True)
-        try:
-            v = SVP.shortest_vector(M, method="fast", pruning=False, preprocess=False)
-        except Exception as e:
-            result_q.put(("err", idx, frames, W, f"SVP: {e}"))
-            return
-
-        key = try_extract_key([int(x) for x in v], A_unsigned, outs, W=W, WT=WT)
-        if key is not None and verify_all(seed, outs_full, key):
-            result_q.put(("ok", idx, frames, W, key.hex()))
-            return
-
-        result_q.put(("miss", idx, frames, W, "no key"))
+    # Worker is defined at module level for spawn-based multiprocessing (macOS/Py3.13).
 
     procs: List[Tuple[mp.Process, float, int, int, int, int]] = []
     next_i = 0
     running = 0
     done = 0
     last_heartbeat = 0.0
+    # Track latest stage per worker id for richer progress output.
+    stages: Dict[int, str] = {}
+    counts: Dict[str, int] = {"start": 0, "lll": 0, "scan": 0, "svp": 0}
 
     def start_one() -> None:
         nonlocal next_i, running
@@ -327,7 +342,23 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
             return
         frames, W, r = attempts[next_i]
         idx = next_i
-        p = mp.Process(target=worker, args=(idx, frames, W, r), daemon=True)
+        p = mp.Process(
+            target=_worker_entry,
+            args=(
+                result_q,
+                stop_evt,
+                seed,
+                outs_full,
+                A_unsigned_full,
+                A_signed_full,
+                WT,
+                idx,
+                frames,
+                W,
+                r,
+            ),
+            daemon=True,
+        )
         p.start()
         procs.append((p, time.time(), idx, frames, W, r))
         running += 1
@@ -341,7 +372,11 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
     while done < total:
         now = time.time()
         if now - last_heartbeat >= 5:
-            print(f"[*] progress: done={done}/{total} running={running} queued={total - next_i}", flush=True)
+            stage_str = " ".join(f"{k}={counts.get(k,0)}" for k in ("lll", "scan", "svp"))
+            print(
+                f"[*] progress: done={done}/{total} running={running} queued={total - next_i} {stage_str}",
+                flush=True,
+            )
             last_heartbeat = now
 
         # Enforce SVP timeout by killing long-running workers.
@@ -375,7 +410,17 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
                 break
             continue
 
-        kind, idx, frames, W, payload = msg
+        kind = msg[0]
+        if kind == "stat":
+            _, idx, frames, W, r, stage = msg
+            prev = stages.get(idx)
+            if prev is not None:
+                counts[prev] = max(0, counts.get(prev, 0) - 1)
+            stages[idx] = stage
+            counts[stage] = counts.get(stage, 0) + 1
+            continue
+
+        _, idx, frames, W, r, payload = msg
         # One worker finished (or errored). Mark it done by reaping on next iteration.
         if kind == "ok":
             print(f"[+] FOUND key by idx={idx} frames={frames} W={W}", flush=True)
@@ -390,7 +435,7 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
                         pass
             return bytes.fromhex(key_hex)
         elif kind in ("err", "miss", "skip"):
-            print(f"[*] worker idx={idx} frames={frames} W={W} -> {kind}: {payload}", flush=True)
+            print(f"[*] worker idx={idx} frames={frames} W={W} r={r} -> {kind}: {payload}", flush=True)
 
         # Reap + refill quickly.
         alive = []
@@ -398,6 +443,10 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
             if p.is_alive():
                 alive.append((p, start_ts, idx2, frames2, W2, r2))
             else:
+                # Adjust stage counters for exited workers.
+                st = stages.pop(idx2, None)
+                if st is not None:
+                    counts[st] = max(0, counts.get(st, 0) - 1)
                 running -= 1
                 done += 1
         procs = alive
@@ -407,8 +456,46 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
     raise RuntimeError("key not found (all attempts exhausted)")
 
 
+def selftest() -> None:
+    """
+    Local correctness check without network:
+    - Generate random seed/key
+    - Produce ADC-truncated outputs like chall.py
+    - Ensure solver recovers the exact key
+    """
+    n = int(os.environ.get("SELFTEST_N", "3"))
+    jobs = os.environ.get("JOBS", "")
+    print(f"[*] SELFTEST enabled: n={n} JOBS={jobs or '(default)'}", flush=True)
+
+    for t in range(n):
+        seed = os.urandom(8)
+        key = os.urandom(FRAME_LEN)
+
+        rng = random.Random(seed)
+        A = [[rng.getrandbits(32) for _ in range(FRAME_LEN)] for _ in range(NUM_FRAMES)]
+
+        outs: List[int] = []
+        for j in range(NUM_FRAMES):
+            acc = 0
+            row = A[j]
+            for x, y in zip(row, key):
+                acc = (acc + (x * y)) & MASK
+            outs.append(adc_read(acc))
+
+        print(f"[*] SELFTEST case {t+1}/{n}: seed={seed.hex()}", flush=True)
+        got = solve(seed, outs)
+        if got != key:
+            raise RuntimeError(f"SELFTEST failed: got {got.hex()} expected {key.hex()}")
+
+        print("[+] SELFTEST ok", flush=True)
+
+
 def main() -> None:
     _patch_fplll_strategies()
+    if os.environ.get("SELFTEST") == "1":
+        selftest()
+        return
+
     seed, outs, sock = get_signal()
     key = solve(seed, outs)
     sock.sendall(key.hex().encode() + b"\n")
