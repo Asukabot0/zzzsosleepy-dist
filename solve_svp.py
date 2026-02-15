@@ -2,8 +2,11 @@
 import base64
 import os
 import random
+import queue
+import signal
 import struct
 import time
+import multiprocessing as mp
 from typing import List, Tuple, Optional
 
 from fpylll import IntegerMatrix, LLL, SVP, BKZ
@@ -176,61 +179,194 @@ def verify_all(seed: bytes, outs_full: List[int], key: bytes) -> bool:
 
 
 def solve(seed: bytes, outs_full: List[int]) -> bytes:
-    # Centering/scaling parameters (from the intended solution writeup).
-    W = 1 << 14
+    """
+    Multi-core strategy:
+    - Each LLL/SVP call is effectively single-threaded in most fpylll builds.
+    - We parallelize across parameter sets (frames/weights) with multiprocessing.
+    - First worker to find a key wins; others are terminated.
+    """
+
+    # Candidate parameter sets. Keep this small-ish: each worker builds matrices and a lattice.
+    frames_list = [70, 80, 90, 100, 110, 120]
+    W_list = [1 << 13, 1 << 14, 1 << 15]
     WT = 1 << 21
+
+    # Control concurrency. 384 threads does NOT mean 384 safe workers: memory spikes.
+    jobs = int(os.environ.get("JOBS", "0") or "0")
+    if jobs <= 0:
+        jobs = min(32, (os.cpu_count() or 8))
+    jobs = max(1, jobs)
+
+    svp_timeout_s = int(os.environ.get("SVP_TIMEOUT", "600"))  # per-attempt cap (seconds)
 
     t0 = time.time()
     A_unsigned_full, A_signed_full = gen_matrix(seed)
     print(f"[*] Matrix generated in {time.time() - t0:.2f}s", flush=True)
+    print(f"[*] jobs={jobs} svp_timeout={svp_timeout_s}s", flush=True)
 
-    # Try increasing number of equations. More equations increases dimension but can help uniqueness.
-    for frames in (80, 90, 100, 110, 120):
+    attempts: List[Tuple[int, int]] = []
+    for frames in frames_list:
+        for W in W_list:
+            attempts.append((frames, W))
+
+    # Prioritize smaller dimensions first.
+    attempts.sort(key=lambda x: (x[0], x[1]))
+    total = len(attempts)
+
+    # IPC
+    result_q: mp.Queue = mp.Queue()
+    stop_evt = mp.Event()
+
+    def worker(idx: int, frames: int, W: int) -> None:
+        try:
+            # Allow parent to kill us cleanly.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except Exception:
+            pass
+
         outs = outs_full[:frames]
         A_unsigned = A_unsigned_full[:frames]
         A_signed = A_signed_full[:frames]
 
-        print(f"[*] === frames={frames} dim={FRAME_LEN + frames + 1} ===", flush=True)
-        t1 = time.time()
-        B = build_B(A_signed, outs)
-        M = build_basis(A_signed, B, W=W, WT=WT)
-        print(f"[*] Built basis in {time.time() - t1:.2f}s", flush=True)
+        dim = FRAME_LEN + frames + 1
+        prefix = f"[w{idx:02d} frames={frames} W={W} dim={dim}]"
+        print(f"{prefix} start", flush=True)
 
-        # LLL pre-reduction.
-        print("[*] LLL start", flush=True)
-        t_lll = time.time()
-        LLL.reduction(M, delta=0.99)
-        print(f"[*] LLL done in {time.time() - t_lll:.2f}s", flush=True)
+        try:
+            B = build_B(A_signed, outs)
+            M = build_basis(A_signed, B, W=W, WT=WT)
+        except Exception as e:
+            result_q.put(("err", idx, frames, W, f"build: {e}"))
+            return
 
-        # Check reduced basis vectors first (often hits immediately).
-        dim = M.nrows
-        print(f"[*] Scanning {dim} basis vectors ...", flush=True)
-        for i in range(dim):
-            vec = [int(M[i, j]) for j in range(dim)]
+        try:
+            t_lll = time.time()
+            LLL.reduction(M, delta=0.99)
+            print(f"{prefix} LLL {time.time() - t_lll:.2f}s", flush=True)
+        except Exception as e:
+            result_q.put(("err", idx, frames, W, f"LLL: {e}"))
+            return
+
+        # Scan basis (cheap).
+        for i in range(M.nrows):
+            vec = [int(M[i, j]) for j in range(M.nrows)]
             key = try_extract_key(vec, A_unsigned, outs, W=W, WT=WT)
             if key is None:
                 continue
             if verify_all(seed, outs_full, key):
-                print("[+] Key verified on all frames", flush=True)
-                return key
+                result_q.put(("ok", idx, frames, W, key.hex()))
+                return
 
-        # Avoid BKZ: many builds hit "infinite loop in babai". Use SVP enumeration instead.
-        # Note: SVP may still rely on strategies; _patch_fplll_strategies() handles that.
-        print("[*] Basis scan miss, trying SVP.shortest_vector(preprocess=False) ...", flush=True)
+        if stop_evt.is_set():
+            result_q.put(("skip", idx, frames, W, "stopped"))
+            return
+
+        # SVP call: no incremental progress output inside fpylll, so we time-cap the attempt
+        # by letting the parent terminate the process if it runs too long.
+        print(f"{prefix} SVP start (no internal progress)", flush=True)
         try:
             v = SVP.shortest_vector(M, method="fast", pruning=False, preprocess=False)
         except Exception as e:
-            print(f"[-] SVP failed: {e}", flush=True)
-            continue
+            result_q.put(("err", idx, frames, W, f"SVP: {e}"))
+            return
 
         key = try_extract_key([int(x) for x in v], A_unsigned, outs, W=W, WT=WT)
         if key is not None and verify_all(seed, outs_full, key):
-            print("[+] Key verified on all frames", flush=True)
-            return key
+            result_q.put(("ok", idx, frames, W, key.hex()))
+            return
 
-        print("[*] SVP miss", flush=True)
+        result_q.put(("miss", idx, frames, W, "no key"))
 
-    raise RuntimeError("key not found")
+    procs: List[Tuple[mp.Process, float, int, int, int]] = []
+    next_i = 0
+    running = 0
+    done = 0
+    last_heartbeat = 0.0
+
+    def start_one() -> None:
+        nonlocal next_i, running
+        if next_i >= total:
+            return
+        frames, W = attempts[next_i]
+        idx = next_i
+        p = mp.Process(target=worker, args=(idx, frames, W), daemon=True)
+        p.start()
+        procs.append((p, time.time(), idx, frames, W))
+        running += 1
+        next_i += 1
+
+    # Fill initial slots.
+    while running < jobs and next_i < total:
+        start_one()
+
+    # Main loop: monitor results + enforce per-worker timeout.
+    while done < total:
+        now = time.time()
+        if now - last_heartbeat >= 5:
+            print(f"[*] progress: done={done}/{total} running={running} queued={total - next_i}", flush=True)
+            last_heartbeat = now
+
+        # Enforce SVP timeout by killing long-running workers.
+        for i in range(len(procs)):
+            p, start_ts, idx, frames, W = procs[i]
+            if not p.is_alive():
+                continue
+            if now - start_ts > svp_timeout_s:
+                print(f"[-] timeout: idx={idx} frames={frames} W={W} killing worker", flush=True)
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+        # Drain results if available.
+        try:
+            msg = result_q.get(timeout=0.5)
+        except queue.Empty:
+            # Reap dead workers and start new ones.
+            alive: List[Tuple[mp.Process, float, int, int, int]] = []
+            for p, start_ts, idx, frames, W in procs:
+                if p.is_alive():
+                    alive.append((p, start_ts, idx, frames, W))
+                else:
+                    running -= 1
+                    done += 1
+            procs = alive
+            while running < jobs and next_i < total and not stop_evt.is_set():
+                start_one()
+            if running == 0 and next_i >= total:
+                break
+            continue
+
+        kind, idx, frames, W, payload = msg
+        # One worker finished (or errored). Mark it done by reaping on next iteration.
+        if kind == "ok":
+            print(f"[+] FOUND key by idx={idx} frames={frames} W={W}", flush=True)
+            key_hex = payload
+            stop_evt.set()
+            # Kill all workers.
+            for p, _, _, _, _ in procs:
+                if p.is_alive():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+            return bytes.fromhex(key_hex)
+        elif kind in ("err", "miss", "skip"):
+            print(f"[*] worker idx={idx} frames={frames} W={W} -> {kind}: {payload}", flush=True)
+
+        # Reap + refill quickly.
+        alive = []
+        for p, start_ts, idx2, frames2, W2 in procs:
+            if p.is_alive():
+                alive.append((p, start_ts, idx2, frames2, W2))
+            else:
+                running -= 1
+                done += 1
+        procs = alive
+        while running < jobs and next_i < total and not stop_evt.is_set():
+            start_one()
+
+    raise RuntimeError("key not found (all attempts exhausted)")
 
 
 def main() -> None:
@@ -249,4 +385,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
