@@ -210,8 +210,16 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
             return key
 
     # Setup GSO + siever
-    gso = GSO.Mat(Bmat)
-    gso.update_gso()
+    #
+    # g6k's Siever requires inverse transform data (UinvT) to be enabled in the
+    # underlying fpylll GSO object; otherwise it aborts with:
+    #   ValueError: Siever requires UinvT enabled
+    # fpylll enables this when MatGSO is constructed with a non-None UinvT.
+    U = IntegerMatrix.identity(dim)
+    UinvT = IntegerMatrix.identity(dim)
+    gso = GSO.Mat(Bmat, U=U, UinvT=UinvT, update=True)
+    if not getattr(gso, "inverse_transform_enabled", False):
+        raise RuntimeError("GSO inverse transform not enabled (UinvT); g6k cannot run")
     lll_obj = LLL.Reduction(gso)
     lll_obj()
     gso.update_gso()
