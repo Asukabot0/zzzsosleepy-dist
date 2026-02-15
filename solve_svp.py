@@ -186,9 +186,27 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
     - First worker to find a key wins; others are terminated.
     """
 
-    # Candidate parameter sets. Keep this small-ish: each worker builds matrices and a lattice.
-    frames_list = [70, 80, 90, 100, 110, 120]
-    W_list = [1 << 13, 1 << 14, 1 << 15]
+    # Candidate parameter sets.
+    # Expand aggressively so large machines can stay busy:
+    # - frames sweep: [FRAMES_MIN, FRAMES_MAX] step FRAMES_STEP
+    # - W sweep: [W_MIN_POW, W_MAX_POW] (inclusive) as powers of two
+    # - restarts: repeat each (frames, W) with randomized unimodular perturbations
+    frames_min = int(os.environ.get("FRAMES_MIN", "70"))
+    frames_max = int(os.environ.get("FRAMES_MAX", "120"))
+    frames_step = int(os.environ.get("FRAMES_STEP", "5"))
+    if frames_step <= 0:
+        raise ValueError("FRAMES_STEP must be > 0")
+
+    w_min_pow = int(os.environ.get("W_MIN_POW", "10"))
+    w_max_pow = int(os.environ.get("W_MAX_POW", "18"))
+    if w_min_pow > w_max_pow:
+        raise ValueError("W_MIN_POW must be <= W_MAX_POW")
+
+    restarts = int(os.environ.get("RESTARTS", "30"))
+    restarts = max(1, restarts)
+
+    frames_list = list(range(frames_min, frames_max + 1, frames_step))
+    W_list = [1 << p for p in range(w_min_pow, w_max_pow + 1)]
     WT = 1 << 21
 
     # Control concurrency. 384 threads does NOT mean 384 safe workers: memory spikes.
@@ -204,20 +222,21 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
     print(f"[*] Matrix generated in {time.time() - t0:.2f}s", flush=True)
     print(f"[*] jobs={jobs} svp_timeout={svp_timeout_s}s", flush=True)
 
-    attempts: List[Tuple[int, int]] = []
+    attempts: List[Tuple[int, int, int]] = []
     for frames in frames_list:
         for W in W_list:
-            attempts.append((frames, W))
+            for r in range(restarts):
+                attempts.append((frames, W, r))
 
     # Prioritize smaller dimensions first.
-    attempts.sort(key=lambda x: (x[0], x[1]))
+    attempts.sort(key=lambda x: (x[0], x[1], x[2]))
     total = len(attempts)
 
     # IPC
     result_q: mp.Queue = mp.Queue()
     stop_evt = mp.Event()
 
-    def worker(idx: int, frames: int, W: int) -> None:
+    def worker(idx: int, frames: int, W: int, r: int) -> None:
         try:
             # Allow parent to kill us cleanly.
             signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -229,7 +248,7 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
         A_signed = A_signed_full[:frames]
 
         dim = FRAME_LEN + frames + 1
-        prefix = f"[w{idx:02d} frames={frames} W={W} dim={dim}]"
+        prefix = f"[w{idx:04d} frames={frames} W={W} r={r} dim={dim}]"
         print(f"{prefix} start", flush=True)
 
         try:
@@ -238,6 +257,25 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
         except Exception as e:
             result_q.put(("err", idx, frames, W, f"build: {e}"))
             return
+
+        # Randomized unimodular perturbation to escape unlucky reductions.
+        # This keeps the lattice the same while changing the basis.
+        rng = random.Random(seed + frames.to_bytes(2, "little") + W.to_bytes(4, "little") + r.to_bytes(4, "little"))
+        if r != 0:
+            # Row swaps
+            for i in range(M.nrows - 1, 0, -1):
+                j = rng.randrange(i + 1)
+                if i != j:
+                    M.swap_rows(i, j)
+            # Light row mixing
+            for _ in range(M.nrows // 3):
+                i = rng.randrange(M.nrows)
+                j = rng.randrange(M.nrows)
+                if i == j:
+                    continue
+                c = rng.choice([-2, -1, 1, 2])
+                for col in range(M.ncols):
+                    M[i, col] = int(M[i, col]) + c * int(M[j, col])
 
         try:
             t_lll = time.time()
@@ -277,7 +315,7 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
 
         result_q.put(("miss", idx, frames, W, "no key"))
 
-    procs: List[Tuple[mp.Process, float, int, int, int]] = []
+    procs: List[Tuple[mp.Process, float, int, int, int, int]] = []
     next_i = 0
     running = 0
     done = 0
@@ -287,11 +325,11 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
         nonlocal next_i, running
         if next_i >= total:
             return
-        frames, W = attempts[next_i]
+        frames, W, r = attempts[next_i]
         idx = next_i
-        p = mp.Process(target=worker, args=(idx, frames, W), daemon=True)
+        p = mp.Process(target=worker, args=(idx, frames, W, r), daemon=True)
         p.start()
-        procs.append((p, time.time(), idx, frames, W))
+        procs.append((p, time.time(), idx, frames, W, r))
         running += 1
         next_i += 1
 
@@ -323,10 +361,10 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
             msg = result_q.get(timeout=0.5)
         except queue.Empty:
             # Reap dead workers and start new ones.
-            alive: List[Tuple[mp.Process, float, int, int, int]] = []
-            for p, start_ts, idx, frames, W in procs:
+            alive: List[Tuple[mp.Process, float, int, int, int, int]] = []
+            for p, start_ts, idx, frames, W, r in procs:
                 if p.is_alive():
-                    alive.append((p, start_ts, idx, frames, W))
+                    alive.append((p, start_ts, idx, frames, W, r))
                 else:
                     running -= 1
                     done += 1
@@ -344,7 +382,7 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
             key_hex = payload
             stop_evt.set()
             # Kill all workers.
-            for p, _, _, _, _ in procs:
+            for p, _, _, _, _, _ in procs:
                 if p.is_alive():
                     try:
                         p.terminate()
@@ -356,9 +394,9 @@ def solve(seed: bytes, outs_full: List[int]) -> bytes:
 
         # Reap + refill quickly.
         alive = []
-        for p, start_ts, idx2, frames2, W2 in procs:
+        for p, start_ts, idx2, frames2, W2, r2 in procs:
             if p.is_alive():
-                alive.append((p, start_ts, idx2, frames2, W2))
+                alive.append((p, start_ts, idx2, frames2, W2, r2))
             else:
                 running -= 1
                 done += 1
