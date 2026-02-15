@@ -146,6 +146,33 @@ def try_extract_key(vec: List[int], A_unsigned: List[List[int]], outs: List[int]
     return bytes(key)
 
 
+def _log2_norm2_prefix(vec: List[int], k: int = 80) -> float:
+    # Approx log2 of squared norm, using only first k coordinates for speed.
+    # Good enough to compare relative progress across reductions.
+    s = 0
+    kk = min(k, len(vec))
+    for i in range(kk):
+        x = int(vec[i])
+        s += x * x
+    if s <= 0:
+        return float("-inf")
+    return s.bit_length() - 1
+
+
+def _report_basis(prefix: str, M: IntegerMatrix, WT: int, tag: str) -> None:
+    # Print a tiny digest of the reduced basis so we can see if reduction helps.
+    # We avoid expensive float norms; use log2 of partial norm^2.
+    n = M.nrows
+    top = min(6, n)
+    vals = []
+    for i in range(top):
+        vec = [int(M[i, j]) for j in range(n)]
+        ln = _log2_norm2_prefix(vec)
+        last_ok = abs(int(vec[-1])) == WT
+        vals.append(f"{ln}{'*' if last_ok else ''}")
+    print(f"{prefix} {tag} basis[0:{top}] log2(norm2_prefix)={','.join(vals)}", flush=True)
+
+
 def verify_all(seed: bytes, outs_full: List[int], key: bytes) -> bool:
     A_unsigned, _ = gen_matrix(seed)
     for j in range(NUM_FRAMES):
@@ -216,6 +243,7 @@ def _worker_entry(
         t = time.time()
         LLL.reduction(M, delta=0.99)
         print(f"{prefix} LLL {time.time() - t:.2f}s", flush=True)
+        _report_basis(prefix, M, WT, "after LLL")
     except Exception as e:
         result_q.put(("err", f"{prefix} LLL: {e}"))
         return
@@ -252,6 +280,7 @@ def _worker_entry(
                 ),
             )
             print(f"{prefix} BKZ-{bs} done {time.time() - t:.2f}s", flush=True)
+            _report_basis(prefix, M, WT, f"after BKZ-{bs}")
         except Exception as e:
             # Known fplll failure mode; keep going with other restarts.
             result_q.put(("err", f"{prefix} BKZ-{bs}: {e}"))
@@ -394,4 +423,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
